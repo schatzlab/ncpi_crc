@@ -1,0 +1,450 @@
+---
+title: "Differential expression - NCPI"
+author: "Michael Tassia"
+date: "2024-07-09"
+output: html_document
+---
+
+## Outline
+
+-   [Introduction](#introduction)
+
+-   [Environment preparation](#environment)
+
+-   [`DESeq2` analysis, results, & visualization](#deseq2)
+
+    -   [Visualizing autosomes](#autosomes)
+
+------------------------------------------------------------------------
+
+## Introduction {#introduction}
+
+In this document, we will describe the procedures used to generate differential gene expression (DGE) results for the AMR continental group (as a proxy for individuals with Latin American ancestry).
+
+The analysis presented below uses [MAGE](https://github.com/mccoy-lab/MAGE), an RNA-seq data set generated from lymphoblastoid cell lines derived of 731 individuals from the [1000 Genomes Project](https://doi.org/10.1038/nature15393) (1KGP). We will describe the formats of input from the MAGE data set below as they become relevant. Additionally, the `DESeq2` pipeline described below broadly aligns with that described by the `DESeq2` vignette (with some modifications to account for the complex design formula and factor contrasts to extract differential expression of the AMR continental group).
+
+------------------------------------------------------------------------
+
+## Environment preparation {#environment}
+
+First, load/install the packages necessary for preparation, analysis, and visualization.
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+if (!require("DESeq2", quietly = TRUE))
+    BiocManager::install("DESeq2")
+if (!require("tximport", quietly = TRUE))
+    BiocManager::install("tximport")
+if (!require("BiocParallel", quietly = TRUE))
+    BiocManager::install("BiocParallel")
+if (!require("EnsDb.Hsapiens.v86", quietly = TRUE))
+    BiocManager::install("EnsDb.Hsapiens.v86")
+if (!require("tidyverse", quietly = TRUE))
+    install.packages("tidyverse")
+if (!require("data.table", quietly = TRUE))
+    install.packages("data.table")
+if (!require("ggrepel", quietly = TRUE))
+    install.packages("ggrepel")
+if (!require("cowplot", quietly = TRUE))
+    install.packages("cowplot")
+```
+
+With packages loaded, we'll next prepare the input and metadata for `DESeq2`. We'll load three forms of data:
+
+1.  **Expression pseudocounts** (`*quant.sf.gz`) generated with `Salmon` for each of the 731 individuals (779 total libraries with technical replicates) included in MAGE (MAGE used [GENCODE v38](https://www.gencodegenes.org/human/release_38.html) for expression quantification).
+2.  **Metadata** containing the relevant covariates for each individual (i.e. sequencing batch, sex, and population label).
+3.  A **transcript-to-gene** (`tx2gene`) table to convert transcript-level pseudocounts to gene-level pseudocounts with [`tximport`](https://bioconductor.org/packages/release/bioc/vignettes/tximport/inst/doc/tximport.html)
+
+```{r, results=FALSE, message=FALSE, warning=TRUE}
+
+#Load and prepare metadata
+metadata<-read.csv("metadata.csv") %>% 
+  as.data.frame()
+rownames(metadata)<-metadata$library_id
+metadata$batch<-as.factor(metadata$batch)
+metadata$contGroup<-as.factor(metadata$contGroup)
+metadata$population<-as.factor(metadata$population)
+
+#Load salmon quant file paths
+quant_files<-file.path(getwd(),
+                       "salmon_quants",
+                       paste(metadata$library_id,"quant.sf.gz",sep="."))
+names(quant_files)<-metadata$library_id
+
+#Import transcript2gene table for converting transcript-level psuedocounts to gene-level pseudocounts
+tx2gene<-read.csv("tx2gene.csv")
+
+#Create txi object - slowest step of this code block
+txi<-tximport(files = quant_files,
+              type = "salmon",
+              tx2gene = tx2gene)
+
+#Prepare deseq objects & collapse technical replicates
+deseq.obj<-DESeqDataSetFromTximport(txi = txi,
+                                    colData = metadata,
+                                    design = ~ population + batch + sex)
+deseq.obj<-collapseReplicates(object = deseq.obj,
+                              groupby = deseq.obj$sample_id,
+                              run = deseq.obj$library_id)
+
+#Cleanup
+remove(txi,quant_files,tx2gene)
+```
+
+From this code block, the `deseq.obj` object is used as input to perform the DGE analysis with `DESeq2`.
+
+Note that the design formula above is specified as `design = ~ population + batch + sex`, where `batch` and `sex` are included as technical covariates to help isolate the effect of the AMR continental group label (again, as a proxy for Latin American ancestry) on gene expression.
+
+Importantly, only `population` is used, not `design = ~ population + contGroup + batch + sex`. As each `contGroup` is captured by a combination of `population` factor levels (and thus is colinear with `contGroup`), including both `contGroup` and `population` results in a model matrix that violates the full rank requirements of `DESeq2`'s regression steps. If both variables are included in the design formula, `DESeqDataSetFromTximport` will halt and return an error. Because `population` provides finer resolution to isolate the differential expression effects for each AMR-contained `population` label, we'll use `population` instead of `contGroup`.
+
+------------------------------------------------------------------------
+
+## `DESeq2` analysis, results, & visualization {#deseq2}
+
+In the following code blocks, we'll perform differential expression analysis using the `DESeq` command. To learn more about the `DESeq2` methods/approach, please see the vignette: `vignette("DESeq2")`.
+
+Below, we will parallelize using `MulticoreParam` from the `BiocParallel` package. **Running the `DESeq` command is the most computationally-intensive step of this protocol.**
+
+```{r}
+
+#Register cores for parallel compute
+register(MulticoreParam(6)) #This value can be adjusted according to the number of cores available 
+
+#Run DESeq2 (longest step)
+deseq.obj<-DESeq(object = deseq.obj,
+                 parallel=TRUE) 
+
+#Print
+deseq.obj
+```
+
+Following the code block above, `deseq.obj` contains the analysed results from `DESeq2`. From this object, we can perform a Wald Test for the AMR continental group against the global expression average of all other continental groups (i.e., AFR, EUR, SAS, and EAS).
+
+If our design formula were simpler (e.g., a *condition* categorical variable where the levels are *treatment* and *control*), we could simply use the following command:
+
+```         
+results(object=deseq.obj,contrast=c("condition","treatment","control"))
+```
+
+However, as our regression formula is more complex (including two categorical variables with \>2 levels each) and our focal condition (AMR continental group label) is an assembly of the CLM, MXL, PEL, and PUR population labels, we will have to manually construct a contrast vector for our analysis.\
+\
+The `Model_Matrix` object generated below contains the expanded model matrix capturing each factor level encoded as a dummy-variable. This will become important as we need to construct a numeric contrast vector to extract the AMR vs. non-AMR differential expression results later. For more information on extracting DGE results with multi-level factors, [please see this tutorial](https://github.com/tavareshugo/tutorial_DESeq2_contrasts/blob/main/DESeq2_contrasts.md).
+
+```{r}
+
+#Extract model matrix 
+Model_Matrix<-model.matrix(design(deseq.obj),
+                           colData(deseq.obj))
+
+#Print
+Model_Matrix[1:5,1:5]
+```
+
+Next, we need to extract the coefficient matrix for each population label. The following loop will generate an object for each level of `deseq.obj$population`.
+
+```{r}
+
+#Generates a coefficient matrix for each subpop
+population_list<-levels(deseq.obj$population)
+for (id in population_list) { 
+  var_name<-paste(id,"_coefmat",sep="") #Programatically prepare variable names
+  coef_matrix<-colMeans(Model_Matrix[deseq.obj$population == id,])
+  assign(var_name,coef_matrix) #Assign variable name to object
+  remove(var_name,coef_matrix,id)
+}
+
+```
+
+Each of the coefficient matrices generated with the loop above captures the factor levels present within each population label (n=26). For example, as the sequencing-batching structure of the MAGE project was designed to spread population labels evenly across each sequencing batch, the `batch` dummy-variable coefficients will never be `1` for any single coefficient matrix (as other populations also possess samples in each focal sequencing batch). Furthermore, the intercept for each coefficient matrix should always `= 1`, as each gene's intecept captures the experiment-wide mean count.
+
+```{r}
+
+#Viewing batch coefficients for PEL
+PEL_coefmat[grepl(x=names(PEL_coefmat),pattern = "batch")]
+
+#Viewing intercept coefficient for PEL
+PEL_coefmat[1]
+```
+
+Next, we'll use linear combinations of these coefficient matrices to generate the mean expression coefficient matrices of their parent continental group labels:
+
+```{r}
+
+##Create contGroup coefficient matrices from population coefficient matrices 
+AFR_contGroup_coefmat<-(ACB_coefmat+
+                          ASW_coefmat+
+                          ESN_coefmat+
+                          GWD_coefmat+
+                          LWK_coefmat+
+                          MSL_coefmat+
+                          YRI_coefmat)/7
+AMR_contGroup_coefmat<-(CLM_coefmat+
+                          MXL_coefmat+
+                          PEL_coefmat+
+                          PUR_coefmat)/4
+EAS_contGroup_coefmat<-(CDX_coefmat+
+                          CHB_coefmat+
+                          CHS_coefmat+
+                          JPT_coefmat+
+                          KHV_coefmat)/5
+EUR_contGroup_coefmat<-(CEU_coefmat+
+                          FIN_coefmat+
+                          GBR_coefmat+
+                          IBS_coefmat+
+                          TSI_coefmat)/5
+SAS_contGroup_coefmat<-(BEB_coefmat+
+                          GIH_coefmat+
+                          ITU_coefmat+
+                          PJL_coefmat+
+                          STU_coefmat)/5
+
+focal_contrast<-AMR_contGroup_coefmat-(AFR_contGroup_coefmat+
+                                         EAS_contGroup_coefmat+
+                                         EUR_contGroup_coefmat+
+                                         SAS_contGroup_coefmat)/4
+
+#Print
+focal_contrast[1:5]
+
+#Cleanup
+rm(list = ls(pattern = "coefmat"))
+```
+
+Finally, we'll pass the relevant contrast matrix to `results`. This step can take a few min to run.
+
+```{r}
+
+#Run AMR vs non-AMR contrast
+deseq.res<-results(object = deseq.obj,
+                   contrast = focal_contrast,
+                   parallel=TRUE)
+```
+
+The `deseq.res` object contains the differential expression results for each gene in AMR 1KGP participants vs. the global mean expression among non-AMR participants. These results can be summarized and written to a file using the following commands:
+
+```{r}
+
+#View DESeq2 results summary
+summary(deseq.res,alpha=0.05)
+
+#Save results as a csv
+write_csv(x = as.data.table(deseq.res),
+          file = "AMR_DGE.csv",
+          col_names = T)
+```
+
+For further analysis/visualization of results, `as.data.table(deseq.res)` can be used to extract common metrics of differential expression, including the modeled `baseMean` for each gene (experiment-wide), `log2FoldChange` expression values (effect sizes from the Wald Test), and the FDR-corrected p-values (`padj`). To read more about the `DESeq2` model for FDR-correction and independent filtering, see the [relevant section of the vignette](https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#independent-filtering-and-multiple-testing).
+
+Below are a couple options for visualization of these results using methods built into `DESeq2` and custom plotting with `ggplot2` (which may provide some more flexibility):
+
+```{r}
+
+#DESeq2 MA plot
+plotMA(deseq.res)
+```
+
+```{r, warning=FALSE}
+
+#ggplot2 MA plot
+AMR_df <- as.data.table(deseq.res) %>% 
+  mutate(sig = case_when(padj <= 0.05 & log2FoldChange > 0 ~ factor("Up-regulated"),
+                         padj <= 0.05 & log2FoldChange < 0 ~ factor("Down-regulated"),
+                         padj > 0.05 ~ factor("none"),
+                         is.na(padj) ~ factor("none")))
+ggplot(data = AMR_df %>% dplyr::filter(sig == "none"),
+       mapping = aes(x=baseMean,
+                     y=log2FoldChange)) +
+  geom_point(size=0.5,color="gray90") +
+  geom_point(data = AMR_df %>% dplyr::filter(sig == "Up-regulated"),
+             mapping = aes(x=baseMean,
+                           y=log2FoldChange,
+                           color=sig),
+             size=0.75) +
+  geom_point(data = AMR_df %>% dplyr::filter(sig == "Down-regulated"),
+             mapping = aes(x=baseMean,
+                           y=log2FoldChange,
+                           color=sig),
+             size=0.75) +
+  geom_hline(yintercept=0) +
+  scale_x_log10(limits=c(1e-3,1e6),breaks=10^(-3:6)) +
+  scale_y_continuous(limits=c(-1,1)) +
+  scale_color_brewer(palette="Set2")+
+  theme_minimal() +
+  labs(x="Mean of normalized counts",y="Log2(Fold-change)",color="DEGs")
+```
+
+------------------------------------------------------------------------
+
+## Visualizing autosomal DE genes {#autosomes}
+
+We can also filter results visualization to only genes present on autosomes. While sex chromosome comparisons can be performed, focussing on autosomes ensures we leverage the full MAGE data set. Noteably, `sex` is included in our design formula - so the effects of `sex` on gene expression are captured by our regression estimates.
+
+First, we'll plot a reflected-histogram highlighting the number of up- and down-regulated which meet our inclusion threshold for statistical significance (i.e., `padj ≥ 0.05`).
+
+```{r, warning = FALSE}
+
+#load autosomal genes to a vector
+genes.aut<-read_tsv(file="genes.gencode_v46.bed.gz",
+                    comment = "#",
+                    col_names = c("chrom","start","stop","pol","ens")) %>%
+  filter(!chrom %in% c("chrX","chrY","chrM")) %>%
+  pull(ens)
+
+#prepare a df for histogram of up- and down-regulated genes
+df<-deseq.res %>% 
+  as.data.frame() %>%
+  filter(!is.na(padj),padj <= 0.05) %>% #filter for significant genes
+  rownames_to_column(var="gene")
+max<-round(max(abs(df$log2FoldChange))) #get max value for x-axis
+df$effect<-ifelse(df$log2FoldChange > 0,"Up-regulated","Down-regulated") #add effect column
+
+#plot histogram of log2FoldChange
+ggplot(df,aes(x=log2FoldChange,fill=effect)) +
+  geom_histogram(binwidth=0.1,boundary=0,alpha=0.5) +
+  geom_histogram(data=df %>% filter(gene %in% genes.aut),
+                 binwidth=0.1,
+                 boundary=0,
+                 color="white")+
+  scale_fill_brewer(palette="Set2",guide="none",direction = -1) +
+  scale_x_continuous(limits=c(-5,5),breaks=scales::pretty_breaks())+
+  scale_y_continuous(breaks=scales::pretty_breaks()) +
+  theme_cowplot() +
+  theme(axis.title=element_text(face="bold",size=16),
+        axis.text=element_text(size=14)) +
+  labs(x="Log2 fold-change",y="Genes (count)")
+
+
+```
+
+Just as we did above, we can also generate an MA plot that captures the relationship between mean expression and the DE effect estimates. Here, however, we're using point size to capture information about whether a gene is autosomally localized.
+
+```{r, warning=FALSE}
+
+#prep data for MA plot
+AMR_df <- as.data.table(deseq.res) #convert to data.table
+AMR_df$gene<-rownames(deseq.res) #add gene column
+AMR_df<-AMR_df %>% dplyr::select(gene,colnames(AMR_df)[1:6]) #select relevant columns
+AMR_df$autosomal<-FALSE #add autosomal column
+AMR_df[gene %in% genes.aut,]$autosomal<-TRUE #set autosomal column to TRUE for autosomal genes
+AMR_df$gene<-substr(AMR_df$gene,1,15) #shorten gene names
+AMR_df$Symbol<-mapIds(EnsDb.Hsapiens.v86, keys=AMR_df$gene, column="SYMBOL", keytype="GENEID", multiVals="first") #add gene symbols
+AMR_df[is.na(AMR_df$Symbol),]$Symbol<-AMR_df[is.na(AMR_df$Symbol),]$gene #fill in missing gene symbols
+
+# annotate significantly DE genes
+AMR_df$sig<-"none" 
+AMR_df[AMR_df$padj <= 0.05 & AMR_df$log2FoldChange > 0,]$sig<-"Up-regulated"
+AMR_df[AMR_df$padj <= 0.05 & AMR_df$log2FoldChange < 0,]$sig<-"Down-regulated"
+
+# annotate DE effect
+AMR_df$effect<-"none"
+AMR_df[AMR_df$padj <= 0.05 & AMR_df$log2FoldChange >= 2,]$effect<-"Up"
+AMR_df[AMR_df$padj <= 0.05 & AMR_df$log2FoldChange <= -2,]$effect<-"Down"
+
+#plot MA plot
+ggplot() +
+  geom_hline(yintercept=0) +
+  geom_point(data = AMR_df %>% dplyr::filter(sig == "none",!is.na(padj)),
+             mapping = aes(x=baseMean,
+                           y=log2FoldChange),
+             size=0.5,
+             color="gray80",
+             alpha=0.25) + #scatter plot background for non DE genes
+  geom_point(data = AMR_df %>% dplyr::filter(sig == "Up-regulated"),
+             mapping = aes(x=baseMean,
+                           y=log2FoldChange,
+                           color=sig,
+                           size=autosomal),
+
+             alpha=1) + #scatter plot foreground for up-regulated genes
+  geom_point(data = AMR_df %>% dplyr::filter(sig == "Down-regulated"),
+             mapping = aes(x=baseMean,
+                           y=log2FoldChange,
+                           color=sig,
+                           size=autosomal),
+             alpha=1) + #scatter plot foreground for down-regulated genes
+  geom_label_repel(data = AMR_df %>% 
+               filter(padj <= 0.05,autosomal) %>% 
+               group_by(sig) %>% 
+               arrange(-abs(log2FoldChange),.by_group = T) %>% 
+               slice_max(n=20,order_by = abs(log2FoldChange)),
+             aes(label=Symbol,color=sig,x=baseMean,y=log2FoldChange),
+             show.legend=F) + #labels for the top 20 DEGs (per up- and down-regulated)
+  scale_x_continuous(trans='log10',
+                     breaks=10^seq(-3,10)) +
+  scale_size_manual(values=c(1,2)) +
+  scale_color_brewer(palette="Set2",direction=-1) +
+  theme_cowplot() +
+  theme(panel.grid.major = element_line(color="gray90",
+                                        linewidth=0.25),
+        legend.position = c(1,1),
+        legend.justification = c("right","top"),
+        legend.box.background = element_rect(fill="white",color="transparent"),
+        legend.title = element_text(face="bold",size=16),
+        legend.text=element_text(size=14),
+        axis.title=element_text(face="bold",size=16),
+        axis.text=element_text(size=14)) +
+  guides(size = guide_legend(override.aes = list(color="gray",alpha=1)),
+         color = guide_legend(override.aes = list(shape=16,alpha=1,size=2))) +
+  labs(x="Mean of normalized counts",
+       y="Log2 fold-change",
+       size="Autosomal",
+       color="DEGs")
+
+```
+
+Finally, we can generate a volcano plot for the DE genes on autosomes. As before, `|log2FoldChange|` ≥ 2 is used as the threshold for a "large DE effect" for any given gene. Again, size is being used to distinguish autosomal genes from sex chromosome genes.
+
+```{r,warning=FALSE}
+
+#Volcano plot
+ggplot(mapping = aes(x = log2FoldChange, 
+                     y = -log10(padj), 
+                     color = effect)) +
+  geom_hline(yintercept=-log10(0.05),
+             color="gray80",
+             linewidth=0.5,
+             linetype=2) + # significance threshold vline
+  geom_vline(xintercept=c(-2,2),
+             color="gray80",
+             linewidth=0.5,
+             linetype = 2) + # strong effect hlines
+  geom_point(data=AMR_df %>% filter(!is.na(padj),sig == "none"),
+             size=0.1,
+             color="gray90") + # background scatter plot for non DE genes
+    geom_point(data=AMR_df %>% filter(!is.na(padj),effect == "none",!sig=="none"),
+             size=0.1,
+             color="gray75") + # background scatter plot for DE, but small effect genes
+  geom_point(data=AMR_df %>% filter(!is.na(padj),!effect == "none"),
+             aes(size=autosomal)) + # foreground scatter plot for strong effect DE genes
+  geom_label_repel(data = AMR_df %>%
+               filter(padj <= 0.05,autosomal,!effect == "none") %>%
+               group_by(sig) %>%
+               arrange(-abs(log2FoldChange),.by_group = T) %>%
+               slice_max(n=20,order_by = abs(log2FoldChange)),
+                  mapping = aes(label = Symbol),
+                  max.overlaps = 100,
+                  size=5) + #labels for the top 20 DEGs (per up- and down-regulated)
+  scale_size_manual(values=c(1,2)) +
+  scale_x_continuous(limits=c(-max(abs(AMR_df$log2FoldChange),na.rm = T),
+                              max(abs(AMR_df$log2FoldChange),na.rm = T))) +
+  scale_color_manual(values = c("none" = "gray75",
+                                "Up"="#66C2A5",
+                                "Down"="#FC8D62"),
+                     guide="none") +
+  theme_minimal() +
+theme(panel.grid.major = element_line(color="gray90",
+                                        linewidth=0.25),
+        legend.position = c(0,1),
+        legend.justification = c("right","top"),
+        legend.box.background = element_rect(fill="white",color="transparent"),
+        legend.title = element_text(face="bold",size=16),
+        legend.text=element_text(size=14),
+        axis.title=element_text(face="bold",size=16),
+        axis.text=element_text(size=14)) +
+  labs(x="Log2 fold-change",
+       y="-Log10(adj. p-value)",
+       size="Autosomal")
+
+```
