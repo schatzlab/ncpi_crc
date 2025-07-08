@@ -1,0 +1,95 @@
+---
+title: "R Notebook for DESeq2 Analysis"
+output: html_notebook
+---
+
+Packages for analysis
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(tibble)
+library(data.table) 
+library(readr) # for reading csv 
+library(writexl) # for writing to excel files
+library(readxl) # for reading excel files
+```
+
+Creating dataframes with tximport count data and metadata for design
+```{r}
+#read tximport data
+countdata <- read_csv("/home/yhuan165/yhuan165/anvil_project/Gene_count_txi.csv")
+
+#Convert Columns to Rows 
+df <- countdata  %>% 
+  column_to_rownames("Gene")
+
+#Read in design file (replicate metadata)
+design <- read_csv("/home/yhuan165/yhuan165/anvil_project/design.csv")
+
+#Select the required coloumn & groups
+df2<- (dplyr::select(df,1:172))
+design2<- design[c(1:172),]
+```
+
+Remove low expressing genes with filter function
+```{r}
+remove_rows_with_low_values <- function(df, threshold = 10, percentage = 0.8) {
+  # Create a logical matrix where TRUE indicates values less than the threshold
+  low_values <- df < threshold
+  # For each row, calculate the percentage of columns with values less than the threshold
+  rows_to_remove <- apply(low_values, 1, function(x) mean(x) >= percentage)
+  # Keep only the rows where the percentage of low values is less than the threshold
+  df_cleaned <- df[!rows_to_remove, ]
+  df_removed <- df[rows_to_remove, ]
+  return(df_cleaned)
+  }
+
+# Apply the function to your data
+result <- remove_rows_with_low_values(df2)
+df2 <- round(result)
+```
+
+DESeq2 Analysis
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = df2,
+  colData = design2,
+  design =  ~ Disease+Population + Disease:Population) #tests for main effects and interaction
+
+#Collapse the replicates
+dds <- collapseReplicates(dds, design2$Replicates, renameCols = TRUE)
+
+#Put what the controls are
+dds$Population <- relevel(dds$Population, ref = "NHW")
+dds$Disease <- relevel(dds$Disease, ref = "NAT")
+
+dds <- DESeq(dds)
+resultsNames(dds) #output terminology for effect tests
+```
+
+Extract results for main effects and interaction effects
+```{r}
+# Main Effects
+res_population <- results(dds, name = "Population_Hispanic_vs_NHW")
+res_disease <- results(dds, name = "Disease_CRC_vs_NAT")
+
+# Extract results for the interaction term
+res_interaction <- results(dds, name = "DiseaseCRC.PopulationHispanic")
+
+# Convert the results to data frames and add gene names as the first column
+population <- data.frame(res_population, stringsAsFactors = FALSE)
+population <- cbind("Gene" = rownames(population), population)
+
+disease <- data.frame(res_disease, stringsAsFactors = FALSE)
+disease <- cbind("Gene" = rownames(disease), disease)
+
+interaction <- data.frame(res_interaction, stringsAsFactors = FALSE)
+interaction <- cbind("Gene" = rownames(interaction), interaction)
+
+# Write the results to Excel files for further inspection
+write_xlsx(population, "Population_main_effects.xlsx")
+write_xlsx(disease, "Disease_main_effects.xlsx")
+write_xlsx(interaction, "DiseaseCRC.PopulationHispanic_interaction_analysis.xlsx")
+```
+
